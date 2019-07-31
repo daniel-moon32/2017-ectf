@@ -1,0 +1,116 @@
+#!/usr/bin/env python2
+"""
+Bootloader Build Tool
+
+This tool is responsible for building the bootloader from source and copying
+the build outputs into the host tools directory for programming.
+"""
+import os
+import random
+import shutil
+import subprocess
+import sys
+import json
+import struct
+import nacl.utils
+import nacl.secret
+
+from intelhex import IntelHex
+
+FILE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+def make_bootloader(update_key=None, readback_key=None):
+    """
+    Build the bootloader from source.
+
+    Return:
+        True if successful, False otherwise.
+    """
+    # Change into directory containing bootloader.
+    bootloader_dir = os.path.join(FILE_DIR, "..", "bootloader")
+
+    subprocess.call('make -C "%s" clean' % bootloader_dir, shell=True)
+
+    # Call make in subprocess to build bootloader -- Pass in secret keys
+    status = subprocess.call('make -C "%s" UD_KEY="%s" RB_KEY="%s"' % (bootloader_dir, update_key, readback_key), shell=True)
+
+    # Return True if make returned 0, otherwise return False.
+    return (status == 0)
+
+def copy_artifacts():
+    """
+    Copy bootloader build artifacts into the host tools directory.
+    """
+    # Get directory containing this file (host_tools).
+    dst_dir = FILE_DIR
+
+    # Get directory containing bootloader output (bootloader).
+    src_dir = os.path.join(os.path.dirname(dst_dir), 'bootloader')
+
+    # Copy build artifacts (.hex files) from bootloader directory.
+    shutil.copy(os.path.join(src_dir, 'flash.hex'), dst_dir)
+    shutil.copy(os.path.join(src_dir, 'eeprom.hex'), dst_dir)
+    shutil.copy(os.path.join(dst_dir, 'lfuse.hex'), src_dir)
+    shutil.copy(os.path.join(dst_dir, 'hfuse.hex'), src_dir)
+    shutil.copy(os.path.join(dst_dir, 'efuse.hex'), src_dir)
+    shutil.copy(os.path.join(dst_dir, 'lock.hex'), src_dir)
+
+def generate_secret_keys():
+    """
+    Generate secret password for readback tool and store to secret file.
+    """
+
+    # Generate secret keys for readback and update modes - 32 bytes each
+    keys = [0,0]
+    keys[0] = nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE).encode('hex')
+    keys[1] = nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE).encode('hex')
+
+    sec_params = {
+            'update_key' : keys[0],
+            'readback_key' : keys[1]
+    }
+
+    # Write security keys to secret file.
+    with open(os.path.join(FILE_DIR, 'secret_build_output.txt'), 'w') as secret_build_output:
+        json.dump(sec_params, secret_build_output)
+    return keys
+
+def write_fuse_file(fuse_name, fuse_value):
+    hex_file = IntelHex()
+    hex_file[0] = fuse_value
+
+    with open(os.path.join(FILE_DIR, fuse_name + '.hex'), 'wb+') as outfile:
+        hex_file.tofile(outfile, format='hex')
+
+if __name__ == '__main__':
+
+    # Get secret keys for readback and updating
+    keys = generate_secret_keys()
+
+    # Format keys to be sent to bootloader
+    # MAGIC PYTHON. JUST ACCEPT IT. DON'T MESS WITH IT
+    a = list(map(''.join, zip(*[iter(keys[0])]*2)))
+    update_key = ''.join(map(lambda i: '0x' + i + ',', a))
+    update_key = '{' + update_key + '}'
+    update_key = update_key[0:len(update_key)-2]
+    update_key = update_key + '}'
+    # MAGIC PYTHON
+    a = list(map(''.join, zip(*[iter(keys[1])]*2)))
+    readback_key = ''.join(map(lambda i: '0x' + i +',', a))
+    readback_key = '{' + readback_key + '}'
+    readback_key = readback_key[0:len(readback_key)-2]
+    readback_key = readback_key + '}'
+
+    # Compile bootloader, pass in secret keys
+    if not make_bootloader(update_key=update_key, readback_key=readback_key):
+        print "ERROR: Failed to compile bootloader"
+        sys.exit(1)
+
+    # Write fuse and lock files
+    write_fuse_file('lfuse', 0xFF)
+    write_fuse_file('hfuse', 0x18)
+    write_fuse_file('efuse', 0xFC)
+    write_fuse_file('lock', 0xCC)
+
+    # Copy .hex outputs between directories
+    copy_artifacts()

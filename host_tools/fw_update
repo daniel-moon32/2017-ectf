@@ -1,0 +1,108 @@
+#!/usr/bin/env python2
+"""
+Firmware Updater Tool
+
+Sends a protected firmware image to the bootloader for installation
+Data should be formatted and protected by fw_protect tool
+
+Frames are sent to bootloader in reverse-address order
+"""
+
+import argparse
+import json
+import serial
+import struct
+import sys
+import zlib
+import time
+
+from cStringIO import StringIO
+from intelhex import IntelHex
+
+RESP_OK = b'\x00'
+
+VERBOSE = 0
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Firmware Update Tool')
+
+    parser.add_argument("--port", help="Serial port to send update over.",
+                        required=True)
+    parser.add_argument("--firmware", help="Path to firmware image to load.",
+                        required=True)
+    parser.add_argument("--debug", "-d", "--verbose", "-v",
+                        help="Enable debugging messages", action='count')
+    args = parser.parse_args()
+
+    VERBOSE = args.debug
+
+    # Open serial port. Set baudrate to 115200. Set timeout to 2 seconds.
+    print('Opening serial port...')
+    ser = serial.Serial(args.port, baudrate=115200, timeout=2)
+
+    # Open firmware file
+    print('Opening firmware file...')
+    with open(args.firmware, 'r') as firmware_in:
+        firmware = json.load(firmware_in)
+
+    # Print firmware version to screen
+    print('Version: {}'.format(firmware['version']))
+
+    # Wait for bootloader to signal that
+    # it is in update mode
+    print('Waiting for bootloader to enter update mode...')
+    while ser.read() != 'U':
+        pass
+
+    if args.debug:
+        print('Version: {}'.format(firmware['version']))
+        print('Number of frames: {}'.format(len(firmware['frames'])))
+
+    # For each frame in protected firmware image,
+    # Send protected data, MAC, and encryption nonce to bootloader
+    for idx, frame in enumerate(firmware['frames']):
+
+        # Format data from protected frame for correct interpretation
+        data = frame['protected_frame'].decode('hex')
+        mac = frame['MAC'].decode('hex')
+        nonce = frame['Nonce'].decode('hex')
+
+        if args.debug:
+            print("Writing frame {} ({} bytes)...".format(idx, frame_size))
+
+        # Send MAC, nonce, and frame to bootloader
+        ser.write(mac)
+        ser.write(data)
+        ser.write(nonce)
+
+        if args.debug:
+            print("")
+            print("MAC:")
+            print(mac.encode('hex'))
+            print("Encrypted Frame:")
+            print(data.encode('hex'))
+            print("")
+
+        # Wait for an OK from bootloader to verify MAC
+        resp = ser.read()
+        if resp != RESP_OK:
+            raise RuntimeError("ERROR: Bootloader responded with {}".format(repr(resp)))
+
+        # Wait for an OK from bootloader to verify decryption
+        resp = ser.read()
+        time.sleep(0.1)
+        if resp != RESP_OK:
+            raise RuntimeError("ERROR: Bootloader responded with {}".format(repr(resp)))
+
+        if args.debug:
+            print("Resp: {}".format(ord(resp)))
+
+        # Wait for OK from bootloader to confirm frame installation
+        resp = ser.read()
+        if resp != RESP_OK:
+            raise RuntimeError("ERROR installing frame: Bootloader responded with {}".format(repr(resp)))
+            
+        # Display frame number installed
+        print("Frame {} Installed".format(len(firmware['frames'])-idx-1))
+
+    print("Done writing firmware.")

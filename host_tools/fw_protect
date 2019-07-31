@@ -1,0 +1,212 @@
+#!/usr/bin/env python2
+"""
+Firmware Bundle-and-Protect Tool
+
+"""
+import argparse
+import shutil
+import struct
+import json
+import zlib
+
+from cStringIO import StringIO
+from intelhex import IntelHex
+
+import nacl.secret
+import nacl.utils
+import nacl.hash
+import nacl.encoding
+
+VERBOSE = 0
+
+class Firmware(object):
+    """
+    Helper for making frames.
+    """
+
+    BLOCK_SIZE = 256
+
+    def __init__(self, hex_data, message, version):
+        self.hex_data = hex_data
+        self.message = message
+        self.version = version
+        self.reader = IntelHex(self.hex_data)
+
+    def construct_frame(self, data, frame_no, is_message=False):
+        """
+        Makes a frame with designated data.
+
+        Total frame size with "metadata": 262 bytes after encryption
+        Firmware Data (256 bytes)- Firmware data to be installed, padded with zeroes
+        Data Size (2 bytes) - number of bytes in DATA section that are valid firmware
+        Version (2 bytes) - version number to check that previous version number is not accepted
+        Frame No. (1 bytes) - Frame number for bootloader to calculate start address
+        is_message (1 byte) - Indicates if DATA section contains the release message
+        """
+
+        frame = b""
+        data_size = len(data)
+        flag = 0
+
+        if is_message:
+            flag |= (1 << 0)
+
+        # Pad message with random bytes if less than block size
+        if data_size < self.BLOCK_SIZE:
+            padding = nacl.utils.random(self.BLOCK_SIZE - data_size)
+            data += padding
+
+        # Add data
+        data_fmt = '>{}s'.format(self.BLOCK_SIZE)
+        frame += struct.pack(data_fmt, data)
+        # Add number of data bytes
+        frame += struct.pack('<H', data_size)
+        # Add version
+        frame += struct.pack('<H', self.version)
+        # Add frame number
+        frame += struct.pack('>B', frame_no)
+        # Add message indicator
+        frame += struct.pack('>B', flag)
+
+        if VERBOSE > 0:
+            print("Generated frame {} at {} ({} bytes, is_message={})".format(
+                frame_no, data_size, flag)
+            )
+
+        return frame
+
+    def frames(self):
+        """
+        Generates a series of packets containing all info needed to secure against attacks
+        """
+        cur_address = -1
+        frame_no = 0
+
+        # Divide firmware image into chunks by address
+        for segment_start, segment_end in self.reader.segments():
+            assert segment_start > cur_address # frame_no can't overflow
+
+            # Segment section into chunks of BLOCK SIZE
+            for address in range(segment_start, segment_end, self.BLOCK_SIZE):
+
+                # Save address for overflow check in next iteration
+                cur_address = address
+
+                # Frame should be BLOCK_SIZE unless it is the last frame.
+                if (address + self.BLOCK_SIZE <= segment_end):
+                    data = self.reader.tobinstr(start=address,
+                                                size=self.BLOCK_SIZE)
+                # Otherwise, Frame should hold remainder of information
+                else:
+                    data = self.reader.tobinstr(start=address,
+                                                size=segment_end - address)
+
+                # Construct frame from data segment
+                yield self.construct_frame(data, frame_no)
+                frame_no += 1
+
+        # Store message size
+        message_size = len(self.message)
+
+        # Segment message into 256 byte blocks
+        for location in range(0, message_size, self.BLOCK_SIZE / 2):
+            # Frame should contain BLOCK_SIZE bytes of the message
+            if (location + (self.BLOCK_SIZE / 2) <= message_size):
+                data = self.message[location : location + (self.BLOCK_SIZE / 2)]
+            # Otherwise, frame should contain remainder of the message
+            else:
+                data = self.message[location : message_size]
+
+            # Construct frame from message data; set message flag to be True
+            yield self.construct_frame(data, frame_no, is_message=True)
+            frame_no += 1
+
+    def close(self):
+        self.reader.close()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Firmware Update Tool')
+
+    parser.add_argument("--infile",
+                        help="Path to the firmware image to protect.",
+                        required=True)
+    parser.add_argument("--outfile", help="Filename for the output firmware.",
+                        required=True)
+    parser.add_argument("--version", help="Version number of this firmware.",
+                        required=True, type=int)
+    parser.add_argument("--message", help="Release message for this firmware.",
+                        required=True)
+    parser.add_argument("--verbose", '-v', action='count')
+    args = parser.parse_args()
+
+    #check debug
+    VERBOSE = args.verbose
+
+    # Create SHA256 hasher
+    HASHER = nacl.hash.sha512
+
+    # Create firmware object to write data frames
+    fw_chunker = Firmware(hex_data=args.infile, message=args.message, version=args.version)
+
+    # Load secret keys from secre_configure_output
+    with open("secret_configure_output.txt", "r") as f:
+        secret_params = json.load(f)
+
+    # Save value for update key decoded from HEX
+    key = secret_params['update_key'].decode('hex')
+
+    # Create object for encrypting frames with the update key
+    box = nacl.secret.SecretBox(key)
+
+    enc_frames = []
+
+    # Partition firmware into encrypted frames of data
+    for idx, frame in enumerate(fw_chunker.frames()):
+
+        # Generate nonce for data frame
+        nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
+
+        # Encrypt frame data with update key
+        # Output will have form: nonce : auth : data
+        enc_frame = box.encrypt(frame, nonce)
+
+        #Remove nonce from ciphertext
+        enc_frame = enc_frame[24:]
+
+        # Create a MAC to authenticate frame on bootloader
+        # Append key, nonce, and frame
+        msg = key + nonce + enc_frame
+        # Create first layer of MAC by hashing nonce and frame
+        mac1 = HASHER(msg).decode('hex')
+
+        # Append key to mac1
+        msg = key + mac1
+        # Create full MAC by hashing mac1 with protected frame
+        mac = HASHER(msg)
+
+        # Format frame with nonce and MAC in dictionary
+        full_frame = {
+            'MAC': mac,
+            'Nonce': nonce.encode('hex'),
+            'protected_frame': enc_frame.encode('hex')
+        }
+
+        # Prepend frame to array of frames (for reverse installation)
+        enc_frames.insert(0,full_frame)
+
+        if VERBOSE:
+            print("Writing frame {} ({} bytes)...".format(idx, len(enc_frame)))
+
+    # Include extra information in final
+    # dictionary for version number and
+    # number of frames
+    data = {
+        'version': args.version,
+        'frames': enc_frames
+    }
+
+    # Write entire protected, formatted firmware
+    # image to output file
+    with open(args.outfile, 'wb+') as outfile:
+        data = json.dumps(data, indent=2)
+        outfile.write(data)
