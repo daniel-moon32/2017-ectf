@@ -4,8 +4,5 @@
 # Ignore other build files
 */*.map
 
-# Local settings should not be committed to git.
-Vagrantfile.local
-
 # Logfile created by vagrant.
 ubuntu-xenial-16.04-cloudimg-console.log
